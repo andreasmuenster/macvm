@@ -22,10 +22,12 @@ Das Grafikgerät ist auch im Headless-Betrieb konfiguriert, weil der Gast nur da
 
 ```bash
 xcode-select --install        # falls noch nicht vorhanden
-./build.sh
+make                          # bauen und signieren
+make install                  # optional: nach ~/.local/bin (anderes Ziel: make install PREFIX=/opt/macvm)
+make clean
 ```
 
-`build.sh` signiert das Binary ad-hoc mit genau einer Berechtigung: `com.apple.security.virtualization`. Ein Apple-Developer-Account ist nicht nötig.
+`make` signiert das Binary ad-hoc mit genau einer Berechtigung, `com.apple.security.virtualization`, und zeigt sie zur Kontrolle an. Ein Apple-Developer-Account ist nicht nötig. Neu gebaut wird nur, wenn sich `main.swift` oder die Entitlements geändert haben.
 
 ## Benutzen
 
@@ -49,9 +51,32 @@ curl -L -o ~/vms/macos.ipsw "<URL von oben>"
 ./macvm firewall on ~/vms/omlx-vm
 ```
 
-Beim Herunterfahren gilt:
-- **Ctrl-C** oder Fenster schließen fordert ein sauberes Herunterfahren an.
-- Ein **zweites Ctrl-C** stoppt die VM hart.
+## Stoppen
+
+```bash
+./macvm stop ~/vms/omlx-vm --user <gast-user>   # erstes Mal: User angeben, wird gespeichert
+./macvm stop ~/vms/omlx-vm                      # danach reicht das
+./macvm stop ~/vms/omlx-vm --force              # sofort hart stoppen
+```
+
+`stop` arbeitet in drei Stufen:
+1. **Sauber:** Per SSH führt macvm im Gast `sudo -n /sbin/shutdown -h now` aus. Ist kein User hinterlegt oder schlägt SSH fehl, schickt es stattdessen die Power-Taste.
+2. **Hart:** Ist der Gast nach `--timeout` Sekunden (Standard 90) noch nicht unten, stoppt macvm die VM hart. Das ist wie Stecker ziehen.
+3. **Notfall:** Reagiert macvm selbst nicht mehr, wird der Prozess beendet.
+
+Für Stufe 1 braucht der Gast-User passwortloses sudo, aber **nur für shutdown**. Einmalig im Gast ausführen:
+
+```bash
+echo "$(whoami) ALL=(root) NOPASSWD: /sbin/shutdown" | sudo tee /etc/sudoers.d/macvm-shutdown
+sudo chmod 440 /etc/sudoers.d/macvm-shutdown
+sudo visudo -cf /etc/sudoers.d/macvm-shutdown    # muss "parsed OK" melden
+```
+
+Außerdem musst du dich vom Host aus einmal manuell per `ssh` anmelden, damit der Host-Key bekannt ist. `stop` läuft ohne Rückfragen und bricht bei unbekannten Host-Keys ab.
+
+Das Stoppen von Hand geht so:
+- **Ctrl-C** im Vordergrund oder Fenster schließen fordert ein sauberes Herunterfahren an. Ein **zweites Ctrl-C** stoppt die VM hart.
+- macvm legt beim Start `macvm.pid` im VM-Verzeichnis an und verhindert damit, dass dieselbe VM doppelt gestartet wird.
 
 CPU und RAM änderst du in `config.json` im VM-Verzeichnis, während die VM gestoppt ist.
 
