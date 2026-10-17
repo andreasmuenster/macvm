@@ -55,6 +55,35 @@ Beim Herunterfahren gilt:
 
 CPU und RAM änderst du in `config.json` im VM-Verzeichnis, während die VM gestoppt ist.
 
+## Modellordner freigeben (read-only)
+
+Damit die rund 100 GB Modelle nicht doppelt auf der SSD liegen, kann macvm genau einen Host-Ordner per VirtioFS schreibgeschützt in den Gast einhängen.
+
+```bash
+mkdir -p ~/vms/models
+# Modelle hierher verschieben, z. B. aus ~/.omlx/models:
+mv ~/.omlx/models/<modellname> ~/vms/models/
+
+./macvm run ~/vms/omlx-vm --models ~/vms/models     # wird in config.json gespeichert
+./macvm run ~/vms/omlx-vm                           # nutzt die gespeicherte Freigabe
+./macvm run ~/vms/omlx-vm --no-models               # Freigabe entfernen
+```
+
+Im Gast erscheint der Ordner automatisch unter `/Volumes/My Shared Files/models`. oMLX startest du dort entsprechend:
+
+```bash
+omlx serve --model-dir "/Volumes/My Shared Files/models" ...
+```
+
+Im LaunchAgent gehört der Pfad als eigenes `<string>` hinter `--model-dir`, ohne Anführungszeichen.
+
+**Zur Sicherheit:**
+- **Schreibschutz:** Der Gast kann im Ordner nichts ändern, löschen oder anlegen. Ein kompromittiertes oMLX kann deine Modelle also nicht manipulieren.
+- **Nur Modelle freigeben:** Der Ordner sollte ausschließlich Modelle enthalten, also keine Settings, Caches oder Schlüssel. macvm verweigert `/`, `/Users`, `/Volumes` und dein Home-Verzeichnis.
+- **Keine absoluten Symlinks:** Leg im Ordner echte Dateien ab. Absolute Symlinks zeigen im Gast ins Leere, relative innerhalb des Ordners funktionieren.
+- **Zusätzliche Angriffsfläche:** Der Gast spricht jetzt mit Apples VirtioFS-Server auf dem Host. Das ist mehr als eine nackte Disk, bei read-only aber vertretbar.
+- **Ladezeit:** Ein Modell über VirtioFS zu laden dauert länger als von der Gast-Disk. Das betrifft nur das einmalige Laden, die Inferenz danach ist unverändert. Miss es im Benchmark mit.
+
 ## Firewall
 
 Die Regeln laufen in **pf auf dem Host**, also außerhalb der Reichweite des Gasts. Selbst wer im Gast Root-Rechte hat, kann sie nicht abschalten.
@@ -120,4 +149,4 @@ Original und Klon dürfen nicht gleichzeitig laufen, weil sie dieselbe Machine-I
 | `disk.img` | Sparse-Disk des Gasts |
 | `aux.img` | Hilfsspeicher (NVRAM) |
 | `hardware-model.bin`, `machine-id.bin` | Identität der VM |
-| `config.json` | CPUs, RAM, MAC-Adresse, zuletzt genutztes Firewall-Interface |
+| `config.json` | CPUs, RAM, MAC-Adresse, Modellordner, zuletzt genutztes Firewall-Interface |

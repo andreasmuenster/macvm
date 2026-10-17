@@ -72,6 +72,7 @@ struct VMBundle {
     var hardwareModel: URL { dir.appendingPathComponent("hardware-model.bin") }
     var machineID: URL { dir.appendingPathComponent("machine-id.bin") }
     var settingsFile: URL { dir.appendingPathComponent("config.json") }
+    var pidFile: URL { dir.appendingPathComponent("macvm.pid") }
 
     init(path: String) { dir = URL(fileURLWithPath: path).standardizedFileURL }
 }
@@ -84,6 +85,27 @@ struct VMSettings: Codable {
     var firewallInterface: String?
     /// Host-Ordner, der dem Gast schreibgeschützt als /Volumes/My Shared Files/models erscheint.
     var modelsDir: String?
+    /// Benutzer im Gast für `macvm stop` (SSH-Shutdown).
+    var sshUser: String?
+}
+
+// MARK: - PID-Datei
+
+/// Global, damit der atexit-Handler (C-Funktionszeiger, kein Kontext) darauf zugreifen kann.
+var pidFileToRemove: String?
+
+func readPID(_ b: VMBundle) -> pid_t? {
+    guard let s = try? String(contentsOf: b.pidFile, encoding: .utf8),
+        let pid = Int32(s.trimmingCharacters(in: .whitespacesAndNewlines))
+    else { return nil }
+    return pid
+}
+
+/// Läuft unter dieser PID wirklich ein macvm? (Schutz gegen veraltete PID-Dateien und PID-Wiederverwendung.)
+func isRunningMacvm(_ pid: pid_t) -> Bool {
+    guard kill(pid, 0) == 0 || errno == EPERM else { return false }
+    let comm = runCapture("/bin/ps", ["-p", "\(pid)", "-o", "comm="]).output
+    return comm.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("macvm")
 }
 
 func loadSettings(_ b: VMBundle) throws -> VMSettings {
@@ -388,6 +410,18 @@ func cmdRun(path: String, gui: Bool, models: String?, noModels: Bool) -> Never {
         fail("\(error)")
     }
 
+    // PID-Datei: verhindert Doppelstart und ermöglicht `macvm stop`.
+    if let old = readPID(b), isRunningMacvm(old) {
+        fail("Diese VM läuft bereits (PID \(old)). Stoppen: macvm stop \(path)")
+    }
+    do { try "\(getpid())\n".write(to: b.pidFile, atomically: true, encoding: .utf8) } catch {
+        fail("PID-Datei nicht schreibbar: \(error)")
+    }
+    pidFileToRemove = b.pidFile.path
+    atexit {
+        if let p = pidFileToRemove { unlink(p) }
+    }
+
     let delegate = VMDelegate()
     vm.delegate = delegate
     keepAlive += [vm, delegate]
@@ -446,6 +480,82 @@ func cmdRun(path: String, gui: Bool, models: String?, noModels: Bool) -> Never {
         app.run()
     }
     dispatchMain()
+}
+
+// MARK: - Befehl: stop
+
+/// Stoppt eine laufende VM in Stufen:
+///  1. sauber: per SSH `sudo -n /sbin/shutdown -h now` im Gast (wenn ein SSH-User hinterlegt ist),
+///     sonst Power-Taste (SIGTERM an macvm → requestStop)
+///  2. nach Timeout: hart (zweites SIGTERM → VZVirtualMachine.stop)
+///  3. wenn macvm selbst hängt: SIGKILL
+func cmdStop(path: String, user: String?, timeout: Int, force: Bool) -> Never {
+    let b = VMBundle(path: path)
+    var settings: VMSettings
+    do { settings = try loadSettings(b) } catch { fail("\(error)") }
+
+    guard let pid = readPID(b), isRunningMacvm(pid) else {
+        try? FileManager.default.removeItem(at: b.pidFile)
+        log("VM läuft nicht.")
+        exit(0)
+    }
+    if let user, user != settings.sshUser {
+        settings.sshUser = user
+        try? saveSettings(settings, b)
+    }
+
+    var termsSent = 0
+    func sendTerm() {
+        kill(pid, SIGTERM)
+        termsSent += 1
+    }
+    func waitForExit(seconds: Int) -> Bool {
+        for _ in 0..<(seconds * 2) {
+            if kill(pid, 0) != 0 && errno == ESRCH { return true }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return kill(pid, 0) != 0 && errno == ESRCH
+    }
+
+    if !force {
+        if let u = settings.sshUser, let ip = leaseIP(for: settings.macAddress) {
+            log("Fahre Gast per SSH herunter (\(u)@\(ip)) …")
+            let r = runCapture("/usr/bin/ssh", [
+                "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                "\(u)@\(ip)", "sudo -n /sbin/shutdown -h now",
+            ])
+            // Bricht der Gast die Verbindung beim Herunterfahren ab, ist das ein Erfolg.
+            let ok = r.status == 0 || r.output.contains("closed by remote host")
+            if !ok {
+                log("SSH-Shutdown fehlgeschlagen: \(r.output.trimmingCharacters(in: .whitespacesAndNewlines))")
+                log("Sende stattdessen die Power-Taste …")
+                sendTerm()
+            }
+        } else {
+            log("Kein SSH-User hinterlegt (--user <name>) – sende die Power-Taste an den Gast …")
+            sendTerm()
+        }
+        if waitForExit(seconds: timeout) {
+            log("VM sauber gestoppt.")
+            exit(0)
+        }
+        log("Gast hat nach \(timeout) s nicht reagiert – stoppe hart.")
+    }
+
+    // macvm: erstes Signal = Power-Taste, zweites = harter Stopp.
+    while termsSent < 2 {
+        sendTerm()
+        Thread.sleep(forTimeInterval: 1)
+    }
+    if waitForExit(seconds: 15) {
+        log("VM hart gestoppt.")
+        exit(0)
+    }
+    log("macvm reagiert nicht – beende den Prozess (SIGKILL).")
+    kill(pid, SIGKILL)
+    _ = waitForExit(seconds: 5)
+    try? FileManager.default.removeItem(at: b.pidFile)
+    exit(0)
 }
 
 // MARK: - Befehl: ip
@@ -581,6 +691,9 @@ let usage = """
       macvm run <dir> [--gui]              VM starten (ohne --gui: headless)
             [--models <ordner>]            Ordner read-only freigeben (wird gespeichert)
             [--no-models]                  Freigabe wieder entfernen
+      macvm stop <dir>                     sauber herunterfahren, nach Timeout hart stoppen
+            [--user <name>]                SSH-User im Gast für den Shutdown (wird gespeichert)
+            [--timeout 90] [--force]       Wartezeit in s / sofort hart stoppen
       macvm ip <dir>                       IP der laufenden VM
       macvm firewall on <dir> [--force]    Gast abschotten (pf auf dem Host, braucht sudo)
       macvm firewall off <dir>             Abschottung aufheben (Wartung: Updates, Downloads)
@@ -623,6 +736,12 @@ case "run":
     let models = option("--models")
     guard let dir = args.first else { log(usage); exit(1) }
     cmdRun(path: dir, gui: gui, models: models, noModels: noModels)
+case "stop":
+    let force = flag("--force")
+    let user = option("--user")
+    let timeout = Int(option("--timeout") ?? "90") ?? 90
+    guard let dir = args.first else { log(usage); exit(1) }
+    cmdStop(path: dir, user: user, timeout: timeout, force: force)
 case "ip":
     guard let dir = args.first else { log(usage); exit(1) }
     cmdIP(path: dir)

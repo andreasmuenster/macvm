@@ -1,0 +1,40 @@
+# Build-Ausgabe von macvm
+macvm/macvm
+*.o
+*.dSYM/
+.build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# VM-Bundles und Installer (gehören nach ~/vms, nie ins Repo)
+*.ipsw
+*.img
+*.asif
+hardware-model.bin
+machine-id.bin
+vms/
+
+# Modelle und KV-Cache
+models/
+*.safetensors
+*.gguf
+*.npz
+.omlx/
+
+# Secrets (API-Keys für oMLX, Tokens, SSH-Keys)
+.env
+.env.*
+*.key
+*.pem
+id_*
+!id_*.pub
+
+# macOS und Editoren
+.DS_Store
+.AppleDouble
+._*
+.vscode/
+.idea/
+*.swp
+*~
