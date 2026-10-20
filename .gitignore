@@ -1,5 +1,5 @@
 # Build-Ausgabe von macvm
-macvm/macvm
+/macvm
 *.o
 *.dSYM/
 .build/
