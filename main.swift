@@ -53,14 +53,20 @@ func runCapture(_ path: String, _ arguments: [String]) -> (status: Int32, output
 }
 
 /// Startet ein Programm mit dem Terminal des Aufrufers (für sudo-Passwortabfrage).
+/// Bewusst posix_spawn statt Process: Process steckt das Kind in eine eigene Prozessgruppe.
+/// Für das Terminal ist es dann ein Hintergrundprozess, sudo wird beim Lesen des Passworts
+/// per SIGTTIN angehalten und macvm wartet ewig.
 @discardableResult
 func runInherited(_ path: String, _ arguments: [String]) -> Int32 {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: path)
-    p.arguments = arguments
-    do { try p.run() } catch { fail("Konnte \(path) nicht starten: \(error)") }
-    p.waitUntilExit()
-    return p.terminationStatus
+    var argv: [UnsafeMutablePointer<CChar>?] = ([path] + arguments).map { strdup($0) } + [nil]
+    defer { argv.forEach { free($0) } }
+    var pid: pid_t = 0
+    let rc = posix_spawn(&pid, path, nil, nil, &argv, environ)
+    guard rc == 0 else { fail("Konnte \(path) nicht starten: \(String(cString: strerror(rc)))") }
+    var status: Int32 = 0
+    while waitpid(pid, &status, 0) == -1 && errno == EINTR {}
+    // WIFEXITED / WEXITSTATUS als Bitoperationen, die Makros gibt es in Swift nicht.
+    return (status & 0x7f) == 0 ? (status >> 8) & 0xff : 128 + (status & 0x7f)
 }
 
 // MARK: - VM-Verzeichnis
@@ -601,6 +607,13 @@ func cmdFirewall(action: String, path: String, force: Bool) -> Never {
     let sudo = "/usr/bin/sudo"
     let pfctl = "/sbin/pfctl"
 
+    // Passwort einmal im Vordergrund abfragen. Spätere sudo-Aufrufe über runCapture laufen in
+    // einer eigenen Prozessgruppe und könnten selbst kein Passwort mehr lesen.
+    if ["on", "off", "status"].contains(action) {
+        log("sudo fragt eventuell nach deinem Passwort (für pfctl).")
+        guard runInherited(sudo, ["-v"]) == 0 else { fail("sudo fehlgeschlagen.") }
+    }
+
     switch action {
     case "on":
         guard let ipString = leaseIP(for: settings.macAddress), let ip = parseIPv4(ipString) else {
@@ -625,7 +638,6 @@ func cmdFirewall(action: String, path: String, force: Bool) -> Never {
         do { try (rules + "\n").write(to: tmp, atomically: true, encoding: .utf8) } catch { fail("\(error)") }
 
         log("VM \(ipString) hängt an \(bridge.name). Lade in Anchor \(anchor):\n\n\(rules)\n")
-        log("sudo fragt eventuell nach deinem Passwort.")
         let loaded = runInherited(sudo, [pfctl, "-a", anchor, "-f", tmp.path])
         try? FileManager.default.removeItem(at: tmp)
         guard loaded == 0 else { fail("Regeln konnten nicht geladen werden (pfctl -f).") }

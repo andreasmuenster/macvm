@@ -84,13 +84,15 @@ Das Fenster bleibt vorerst offen.
 
 ### 3. Host: Zugriff aufs lokale Netzwerk erlauben
 
-Seit macOS 15 brauchen Apps auf dem **Host** eine Erlaubnis, um Adressen im lokalen Netz zu erreichen, also auch die VM. Fehlt sie, schlägt `ssh` und `ping` mit `No route to host` fehl, obwohl die VM einwandfrei läuft.
+Seit macOS 15 brauchen Apps auf dem **Host** eine Erlaubnis, um Adressen im lokalen Netz zu erreichen, also auch die VM. Fehlt sie, schlägt `ssh` mit `No route to host` fehl, obwohl die VM einwandfrei läuft.
 
 Systemeinstellungen → Datenschutz & Sicherheit → **Lokales Netzwerk** öffnen, dein Terminal einschalten (Terminal, iTerm, Ghostty usw.) und das Terminal neu starten.
 
 ```zsh
-ping -c 2 $(./macvm ip $VM)       # muss antworten
+nc -z -w 5 $(./macvm ip $VM) 22 && echo erreichbar     # prüft den SSH-Port
 ```
+
+**`ping` taugt zum Testen nicht.** Die VM antwortet nie auf Ping, auch wenn sie einwandfrei läuft und per SSH erreichbar ist. `ping` meldet nur `Request timeout`. Prüf die Erreichbarkeit deshalb immer mit `nc` auf Port 22 oder direkt mit `ssh`.
 
 ### 4. SSH-Schlüssel hinterlegen
 
@@ -267,7 +269,7 @@ Die Regeln landen im eigenen pf-Anchor `com.apple/macvm-<VM-Name>`. Apples Stand
 # im Gast – alle drei müssen scheitern:
 curl -m 5 https://example.com
 curl -m 5 http://192.168.64.1
-ping -c 2 1.1.1.1
+nc -z -w 5 1.1.1.1 443          # TCP statt ping: ICMP ist in der VM kein verlässlicher Test
 
 # auf dem Host – muss funktionieren:
 ssh $LLM_USER@$(./macvm ip $VM) true
