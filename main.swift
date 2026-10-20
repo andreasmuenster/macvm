@@ -704,11 +704,24 @@ let usage = """
 
 var args = Array(CommandLine.arguments.dropFirst())
 
+/// Wert einer Option wie `--user <name>`. Fehlt der Wert, ist er leer oder sieht er selbst wie eine
+/// Option aus, bricht macvm ab – typischer Fall: `--user $LLM_USER` mit nicht gesetzter Variable.
 func option(_ name: String) -> String? {
-    guard let i = args.firstIndex(of: name), i + 1 < args.count else { return nil }
+    guard let i = args.firstIndex(of: name) else { return nil }
+    guard i + 1 < args.count else { fail("\(name) braucht einen Wert (leere Shell-Variable?)") }
     let v = args[i + 1]
+    if v.trimmingCharacters(in: .whitespaces).isEmpty || v.hasPrefix("--") {
+        fail("\(name) braucht einen Wert, bekommen: '\(v)' (leere Shell-Variable?)")
+    }
     args.removeSubrange(i...(i + 1))
     return v
+}
+
+/// Ganzzahlige Option mit Standardwert; ein Wert, der keine positive Zahl ist, bricht ab.
+func numberOption<T: FixedWidthInteger>(_ name: String, default def: T) -> T {
+    guard let v = option(name) else { return def }
+    guard let n = T(v), n > 0 else { fail("\(name) erwartet eine positive Zahl, bekommen: '\(v)'") }
+    return n
 }
 
 func flag(_ name: String) -> Bool {
@@ -725,9 +738,9 @@ case "ipsw-url":
     cmdIpswURL()
 case "create":
     let ipsw = option("--ipsw")
-    let cpus = Int(option("--cpus") ?? "12") ?? 12
-    let mem = UInt64(option("--memory") ?? "100") ?? 100
-    let disk = UInt64(option("--disk") ?? "250") ?? 250
+    let cpus = numberOption("--cpus", default: 12)
+    let mem = numberOption("--memory", default: UInt64(100))
+    let disk = numberOption("--disk", default: UInt64(250))
     guard let dir = args.first, let ipsw else { log(usage); exit(1) }
     cmdCreate(path: dir, ipsw: ipsw, cpus: cpus, memoryGB: mem, diskGB: disk)
 case "run":
@@ -739,7 +752,7 @@ case "run":
 case "stop":
     let force = flag("--force")
     let user = option("--user")
-    let timeout = Int(option("--timeout") ?? "90") ?? 90
+    let timeout = numberOption("--timeout", default: 90)
     guard let dir = args.first else { log(usage); exit(1) }
     cmdStop(path: dir, user: user, timeout: timeout, force: force)
 case "ip":
