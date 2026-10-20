@@ -15,6 +15,7 @@
 import AppKit
 import Foundation
 import Virtualization
+import vmnet
 
 // MARK: - Hilfen
 
@@ -87,6 +88,9 @@ struct VMSettings: Codable {
     var cpus: Int
     var memoryGB: UInt64
     var macAddress: String
+    /// NAT-Subnetz der VM als CIDR (Standard: 10.77.64.0/24). Weicht bewusst vom macOS-Standard 192.168.64.0/24 ab,
+    /// den VPN-Clients (z. B. GlobalProtect) gern über den Tunnel routen.
+    var subnet: String?
     /// Bridge-Interface, auf das zuletzt Firewall-Regeln geladen wurden (nur Info).
     var firewallInterface: String?
     /// Host-Ordner, der dem Gast schreibgeschützt als /Volumes/My Shared Files/models erscheint.
@@ -148,6 +152,41 @@ func loadPlatform(_ b: VMBundle) throws -> VZMacPlatformConfiguration {
     return p
 }
 
+let defaultSubnet = "10.77.64.0/24"
+/// Spezialwert für `subnet`: macOS wählt das Subnetz selbst (meist 192.168.64.0/24).
+let autoSubnet = "auto"
+
+/// Das vmnet-Netz muss so lange leben wie die VM (Freigabe beendet das Netz).
+var vmnetNetwork: vmnet_network_ref?
+
+/// Legt ein eigenes NAT-Netz mit dem gewünschten Subnetz an (macOS 26+, kein root nötig).
+func makeVmnetNetwork(cidr: String) throws -> vmnet_network_ref {
+    var status: vmnet_return_t = .VMNET_SUCCESS
+    guard let cfg = vmnet_network_configuration_create(.VMNET_SHARED_MODE, &status) else {
+        throw CLIError("vmnet-Konfiguration fehlgeschlagen (Status \(status.rawValue)).")
+    }
+    if cidr != autoSubnet {
+        let parts = cidr.split(separator: "/")
+        guard parts.count == 2, let bits = Int(parts[1]), (8...29).contains(bits) else {
+            throw CLIError("Ungültiges Subnetz '\(cidr)'. Erwartet z. B. 10.77.64.0/24 (Präfix 8–29) oder \"auto\".")
+        }
+        var addr = in_addr()
+        guard inet_pton(AF_INET, String(parts[0]), &addr) == 1 else { throw CLIError("Ungültige Subnetz-Adresse in '\(cidr)'.") }
+        let hostMask = ~UInt32(0) << UInt32(32 - bits)
+        var mask = in_addr(s_addr: hostMask.bigEndian)
+        // vmnet erwartet die Host-/Gateway-Adresse (.1) statt der Netzadresse (.0).
+        addr.s_addr = ((UInt32(bigEndian: addr.s_addr) & hostMask) | 1).bigEndian
+        guard vmnet_network_configuration_set_ipv4_subnet(cfg, &addr, &mask) == .VMNET_SUCCESS else {
+            throw CLIError("Subnetz \(cidr) wurde von vmnet abgelehnt.")
+        }
+    }
+    guard let net = vmnet_network_create(cfg, &status) else {
+        throw CLIError("vmnet-Netz \(cidr) konnte nicht angelegt werden (Status \(status.rawValue)). Kollidiert es mit einem vorhandenen Netz?")
+    }
+    vmnetNetwork = net
+    return net
+}
+
 func makeConfiguration(_ b: VMBundle, _ s: VMSettings, _ platform: VZMacPlatformConfiguration) throws
     -> VZVirtualMachineConfiguration
 {
@@ -166,7 +205,7 @@ func makeConfiguration(_ b: VMBundle, _ s: VMSettings, _ platform: VZMacPlatform
 
     guard let mac = VZMACAddress(string: s.macAddress) else { throw CLIError("Ungültige MAC-Adresse in config.json") }
     let net = VZVirtioNetworkDeviceConfiguration()
-    net.attachment = VZNATNetworkDeviceAttachment()
+    net.attachment = VZVmnetNetworkDeviceAttachment(network: try makeVmnetNetwork(cidr: s.subnet ?? defaultSubnet))
     net.macAddress = mac
     c.networkDevices = [net]
 
@@ -210,10 +249,21 @@ func normalizeMAC(_ mac: String) -> String {
     mac.lowercased().split(separator: ":").map { String(Int($0, radix: 16) ?? 0, radix: 16) }.joined(separator: ":")
 }
 
-/// Sucht die neueste DHCP-Lease des NAT-Netzes (vmnet) zur MAC der VM.
-func leaseIP(for macAddress: String) -> String? {
+/// Liegt die IP im konfigurierten VM-Subnetz? Filtert veraltete Leases aus früheren Netzen heraus.
+func isInSubnet(_ ip: String, _ cidr: String) -> Bool {
+    let parts = cidr.split(separator: "/")
+    guard parts.count == 2, let bits = Int(parts[1]), (1...32).contains(bits),
+        let net = parseIPv4(String(parts[0])), let addr = parseIPv4(ip)
+    else { return false }
+    let mask = ~UInt32(0) << UInt32(32 - bits)
+    return addr & mask == net & mask
+}
+
+/// Sucht die neueste DHCP-Lease des NAT-Netzes (vmnet) zur MAC der VM, nur im Subnetz der VM.
+func leaseIP(for settings: VMSettings) -> String? {
     guard let leases = try? String(contentsOfFile: "/var/db/dhcpd_leases", encoding: .utf8) else { return nil }
-    let wanted = normalizeMAC(macAddress)
+    let wanted = normalizeMAC(settings.macAddress)
+    let subnet = settings.subnet ?? defaultSubnet
     var best: (ip: String, lease: UInt64)?
     for block in leases.components(separatedBy: "}") {
         var ip: String?
@@ -227,7 +277,7 @@ func leaseIP(for macAddress: String) -> String? {
             }
             if t.hasPrefix("lease=0x") { lease = UInt64(t.dropFirst("lease=0x".count), radix: 16) ?? 0 }
         }
-        if hw == wanted, let ip, best == nil || lease > best!.lease {
+        if hw == wanted, let ip, subnet == autoSubnet || isInSubnet(ip, subnet), best == nil || lease > best!.lease {
             best = (ip, lease)
         }
     }
@@ -531,7 +581,7 @@ func cmdStop(path: String, user: String?, timeout: Int, force: Bool) -> Never {
     }
 
     if !force {
-        if let u = settings.llmUser, let ip = leaseIP(for: settings.macAddress) {
+        if let u = settings.llmUser, let ip = leaseIP(for: settings) {
             log("Fahre Gast per SSH herunter (\(u)@\(ip)) …")
             let r = runCapture("/usr/bin/ssh", [
                 "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
@@ -576,7 +626,7 @@ func cmdStop(path: String, user: String?, timeout: Int, force: Bool) -> Never {
 func cmdIP(path: String) -> Never {
     let settings: VMSettings
     do { settings = try loadSettings(VMBundle(path: path)) } catch { fail("\(error)") }
-    guard let ip = leaseIP(for: settings.macAddress) else {
+    guard let ip = leaseIP(for: settings) else {
         fail("Keine IP für MAC \(settings.macAddress) gefunden (läuft die VM und hat sie gebootet?)")
     }
     log(ip)
@@ -614,7 +664,7 @@ func sshTarget(path: String, admin: Bool) -> String {
     do { settings = try loadSettings(VMBundle(path: path)) } catch { fail("\(error)") }
     let (user, flagName) = admin ? (settings.adminUser, "--admin") : (settings.llmUser, "--llm")
     guard let user else { fail("Kein User hinterlegt. Einmalig: macvm users \(path) \(flagName) <name>") }
-    guard let ip = leaseIP(for: settings.macAddress) else {
+    guard let ip = leaseIP(for: settings) else {
         fail("Keine IP für MAC \(settings.macAddress) gefunden (läuft die VM und hat sie gebootet?)")
     }
     return "\(user)@\(ip)"
@@ -677,7 +727,7 @@ func cmdFirewall(action: String, path: String, force: Bool) -> Never {
 
     switch action {
     case "on":
-        guard let ipString = leaseIP(for: settings.macAddress), let ip = parseIPv4(ipString) else {
+        guard let ipString = leaseIP(for: settings), let ip = parseIPv4(ipString) else {
             fail("VM-IP nicht gefunden. Läuft die VM und hat sie gebootet? (macvm ip \(path))")
         }
         let candidates = listBridges().filter { br in br.nets.contains { $0.contains(ip) } }
@@ -734,7 +784,7 @@ func cmdFirewall(action: String, path: String, force: Bool) -> Never {
         }
         log("Regeln:")
         rules.forEach { log("  " + String($0)) }
-        if let ipString = leaseIP(for: settings.macAddress), let ip = parseIPv4(ipString),
+        if let ipString = leaseIP(for: settings), let ip = parseIPv4(ipString),
             let current = listBridges().first(where: { br in br.nets.contains { $0.contains(ip) } }),
             current.name != settings.firewallInterface
         {

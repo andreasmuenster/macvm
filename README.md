@@ -15,6 +15,7 @@ macvm is designed for one job: running local LLM servers (such as [oMLX](https:/
 - [Initial setup](#initial-setup)
 - [Daily operation](#daily-operation)
 - [Configuration](#configuration)
+- [Access through a VPN](#access-through-a-vpn)
 - [Sharing a model folder (read-only)](#sharing-a-model-folder-read-only)
 - [Network isolation (firewall)](#network-isolation-firewall)
 - [Hardening](#hardening)
@@ -31,7 +32,7 @@ macvm is designed for one job: running local LLM servers (such as [oMLX](https:/
 | The guest gets | The guest deliberately does not get |
 |---|---|
 | CPU, RAM, one disk | Writable shared folders |
-| NAT network (`bridge100`, 192.168.64.x) | Clipboard sharing |
+| NAT network (own vmnet network, default 10.77.64.x) | Clipboard sharing |
 | Keyboard, mouse | Audio |
 | Graphics device (paravirtualized Metal GPU) | USB passthrough |
 | Optional: **one** read-only model folder | vsock / serial console |
@@ -130,7 +131,7 @@ In the guest:
 3. **Enable SSH.** Go to System Settings → General → Sharing and turn on **Remote Login**.
 4. **Allow both users to use SSH.** Click **ⓘ** next to Remote Login and add both users under "Allow access for". By default only administrators may log in. Any other user gets `Connection closed` right after entering the correct password.
 5. You can decline **Full Disk Access for remote users**. SSH does not need it.
-6. **Check the IP.** In the guest's Terminal, `ipconfig getifaddr en0` should print a 192.168.64.x address.
+6. **Check the IP.** In the guest's Terminal, `ipconfig getifaddr en0` should print an address from the VM subnet (default 10.77.64.x).
 7. **Install the Command Line Tools. This step is required and only works in the window.** Run `xcode-select --install` as the admin in the guest's Terminal, confirm the dialog, then check with `git --version`. Over headless SSH this does not work, see [Command Line Tools](#command-line-tools-gui-required). The firewall is still off at this point, so the download works.
 
 Then, on the host, tell macvm the two usernames:
@@ -250,6 +251,29 @@ The effective values are logged on start: `VM läuft (12 CPUs, 100 GB, MAC …)`
 
 The disk size is set once by `create` and is not stored in `config.json`. There is no setting to grow the disk later.
 
+The VM's NAT subnet is `10.77.64.0/24` by default. To change it, set `"subnet": "a.b.c.0/24"` in `config.json` and restart the VM (it gets a new IP). `"subnet": "auto"` lets macOS pick its own range (usually `192.168.64.0/24`). If you change the subnet, also update the `Host` entry in `~/.ssh/config` from [Access through a VPN](#access-through-a-vpn).
+
+## Access through a VPN
+
+VPN clients such as GlobalProtect route local subnets, including the VM's, through the tunnel. The guest is then unreachable, and `ssh` hangs without an error. `route -n get <vm-ip>` shows `utun…` instead of `bridge100`. Changing the subnet does not help, because the client does the same for any local range. Binding connections to the VM's interface bypasses the tunnel route.
+
+**SSH (`macvm ssh`, `tunnel`, `copy-id`):** add this to `~/.ssh/config` once, adjusted to your subnet:
+
+```
+Host 10.77.64.*
+    BindInterface bridge100
+```
+
+**HTTP(S) and other ports:** browsers and most tools cannot bind to an interface. Use `macvm tunnel`, which runs over SSH and uses the setting above:
+
+```zsh
+./macvm tunnel ~/vms/omlx-vm 8000   # then open http://localhost:8000
+```
+
+For a single request, `curl --interface bridge100 http://<vm-ip>:8000` and `nc -b bridge100 -z <vm-ip> 22` also work.
+
+If another tool such as Docker or UTM uses vmnet, the VM's bridge may be named `bridge101`. Check with `ifconfig | grep -B1 "inet <subnet-prefix>"` and adjust the name.
+
 ## Sharing a model folder (read-only)
 
 To avoid keeping roughly 100 GB of models on the SSD twice, macvm can mount exactly one host folder into the guest via VirtioFS, read-only.
@@ -293,7 +317,7 @@ You can still reach the guest from the host, via SSH and port-forwarding tunnels
 
 ### How it works
 
-macvm uses the Virtualization.framework NAT network. macOS creates a virtual interface on the host, usually `bridge100`:
+macvm creates its own vmnet NAT network (macOS 26+, no root) with the subnet `10.77.64.0/24` and attaches the VM to it. macOS creates a virtual interface on the host, usually `bridge100`. The subnet differs from the macOS default `192.168.64.0/24` on purpose: VPN clients such as GlobalProtect often route that range through the tunnel, which breaks SSH to the VM. To use another range, set `"subnet": "a.b.c.0/24"` in the VM's `config.json` and restart the VM; the VM gets a new IP.
 
 ```
   Internet / LAN
@@ -302,11 +326,11 @@ macvm uses the Virtualization.framework NAT network. macOS creates a virtual int
    │  en0 (Wi-Fi / Ethernet)                            │
    │    ▲  NAT                                          │
    │    │                                               │
-   │  bridge100  192.168.64.1   ◄── pf rules applied    │
+   │  bridge100  10.77.64.1     ◄── pf rules applied    │
    │    ▲        (DHCP, DNS proxy)                      │
    └────┼───────────────────────────────────────────────┘
         │
-   Guest 192.168.64.x
+   Guest 10.77.64.x
 ```
 
 **Every** packet from the guest enters the host through `bridge100`, including internet traffic, because NAT happens afterwards. Filtering on `bridge100` therefore covers all of the guest's traffic.
@@ -368,7 +392,7 @@ Run this after the first `firewall on`:
 ```zsh
 # in the guest — all three must fail:
 curl -m 5 https://example.com
-curl -m 5 http://192.168.64.1
+curl -m 5 http://10.77.64.1
 nc -z -w 5 1.1.1.1 443  # TCP, not ping: ICMP is not a reliable test here
 
 # on the host — must succeed:
@@ -597,6 +621,7 @@ Do **not** delete `~/vms/models` (only mounted, not part of the VM) or golden-im
 | `Password:` from `firewall …` rejects a correct password | It asks for the **host** password, not the guest's | Enter your Mac login password, see [Which password?](#which-password) |
 | `No ALTQ support in kernel` | Harmless `pfctl` notice on macOS | Ignore |
 | `No route to host` | The host terminal lacks local network permission, or the guest has no IP yet | [Step 3](#3-allow-local-network-access-on-the-host); check `./macvm ip ~/vms/omlx-vm` and allow up to a minute after start |
+| `ssh` or HTTP hangs while a VPN is connected | The VPN routes the VM subnet through the tunnel | [Access through a VPN](#access-through-a-vpn) |
 | `ping` times out | The guest does not answer ICMP | Expected. Test with `nc -z <ip> 22` or `ssh` |
 | Password accepted, then `Connection closed` | User is not in the Remote Login access list | [Step 2](#2-first-boot-with-a-window), item 4 |
 | `Connection refused` | Remote Login is off in the guest | [Step 2](#2-first-boot-with-a-window), item 3 |
