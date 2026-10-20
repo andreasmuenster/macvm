@@ -91,7 +91,11 @@ struct VMSettings: Codable {
     var firewallInterface: String?
     /// Host-Ordner, der dem Gast schreibgeschützt als /Volumes/My Shared Files/models erscheint.
     var modelsDir: String?
-    /// Benutzer im Gast für `macvm stop` (SSH-Shutdown).
+    /// Admin im Gast: Installationen, Wartung (`macvm ssh --admin`, `macvm copy-id --admin`).
+    var adminUser: String?
+    /// Standard-User im Gast: LLM-Server, Tunnel, SSH-Shutdown bei `macvm stop`.
+    var llmUser: String?
+    /// Altes Feld für den Shutdown-User. Wird beim Laden nach `llmUser` übernommen und nicht mehr geschrieben.
     var sshUser: String?
 }
 
@@ -115,7 +119,10 @@ func isRunningMacvm(_ pid: pid_t) -> Bool {
 }
 
 func loadSettings(_ b: VMBundle) throws -> VMSettings {
-    try JSONDecoder().decode(VMSettings.self, from: Data(contentsOf: b.settingsFile))
+    var s = try JSONDecoder().decode(VMSettings.self, from: Data(contentsOf: b.settingsFile))
+    if s.llmUser == nil { s.llmUser = s.sshUser }
+    s.sshUser = nil
+    return s
 }
 
 func saveSettings(_ s: VMSettings, _ b: VMBundle) throws {
@@ -505,8 +512,8 @@ func cmdStop(path: String, user: String?, timeout: Int, force: Bool) -> Never {
         log("VM läuft nicht.")
         exit(0)
     }
-    if let user, user != settings.sshUser {
-        settings.sshUser = user
+    if let user, user != settings.llmUser {
+        settings.llmUser = validUserName(user)
         try? saveSettings(settings, b)
     }
 
@@ -524,7 +531,7 @@ func cmdStop(path: String, user: String?, timeout: Int, force: Bool) -> Never {
     }
 
     if !force {
-        if let u = settings.sshUser, let ip = leaseIP(for: settings.macAddress) {
+        if let u = settings.llmUser, let ip = leaseIP(for: settings.macAddress) {
             log("Fahre Gast per SSH herunter (\(u)@\(ip)) …")
             let r = runCapture("/usr/bin/ssh", [
                 "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
@@ -538,7 +545,7 @@ func cmdStop(path: String, user: String?, timeout: Int, force: Bool) -> Never {
                 sendTerm()
             }
         } else {
-            log("Kein SSH-User hinterlegt (--user <name>) – sende die Power-Taste an den Gast …")
+            log("Kein LLM-User hinterlegt (macvm users <dir> --llm <name>) – sende die Power-Taste an den Gast …")
             sendTerm()
         }
         if waitForExit(seconds: timeout) {
@@ -576,6 +583,50 @@ func cmdIP(path: String) -> Never {
     exit(0)
 }
 
+// MARK: - Befehle: users, ssh, tunnel, copy-id
+
+/// Erlaubte Usernamen: Buchstaben, Ziffern, . _ -, nicht mit - beginnend (sonst hielte ssh ihn für eine Option).
+func validUserName(_ name: String) -> String {
+    let allowed = Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    guard !name.isEmpty, !name.hasPrefix("-"), name.allSatisfy({ allowed.contains($0) }) else {
+        fail("Ungültiger Username '\(name)' (erlaubt: Buchstaben, Ziffern, . _ -)")
+    }
+    return name
+}
+
+func cmdUsers(path: String, admin: String?, llm: String?) -> Never {
+    let b = VMBundle(path: path)
+    var settings: VMSettings
+    do { settings = try loadSettings(b) } catch { fail("\(error)") }
+    if admin != nil || llm != nil {
+        if let admin { settings.adminUser = validUserName(admin) }
+        if let llm { settings.llmUser = validUserName(llm) }
+        do { try saveSettings(settings, b) } catch { fail("\(error)") }
+    }
+    log("admin  \(settings.adminUser ?? "(nicht gesetzt)")")
+    log("llm    \(settings.llmUser ?? "(nicht gesetzt)")")
+    exit(0)
+}
+
+/// Ziel `user@ip` aus config.json. `admin` wählt den Admin statt des LLM-Users.
+func sshTarget(path: String, admin: Bool) -> String {
+    let settings: VMSettings
+    do { settings = try loadSettings(VMBundle(path: path)) } catch { fail("\(error)") }
+    let (user, flagName) = admin ? (settings.adminUser, "--admin") : (settings.llmUser, "--llm")
+    guard let user else { fail("Kein User hinterlegt. Einmalig: macvm users \(path) \(flagName) <name>") }
+    guard let ip = leaseIP(for: settings.macAddress) else {
+        fail("Keine IP für MAC \(settings.macAddress) gefunden (läuft die VM und hat sie gebootet?)")
+    }
+    return "\(user)@\(ip)"
+}
+
+/// Ersetzt macvm durch das Programm. So gehört das Terminal direkt ssh (Passwortabfrage, Ctrl-C, Exit-Code).
+func execTool(_ path: String, _ arguments: [String]) -> Never {
+    var argv: [UnsafeMutablePointer<CChar>?] = ([path] + arguments).map { strdup($0) } + [nil]
+    execv(path, &argv)
+    fail("Konnte \(path) nicht starten: \(String(cString: strerror(errno)))")
+}
+
 // MARK: - Befehl: firewall
 
 /// pf-Anchor pro VM. Liegt unter "com.apple/", weil Apples Standard-/etc/pf.conf
@@ -610,8 +661,18 @@ func cmdFirewall(action: String, path: String, force: Bool) -> Never {
     // Passwort einmal im Vordergrund abfragen. Spätere sudo-Aufrufe über runCapture laufen in
     // einer eigenen Prozessgruppe und könnten selbst kein Passwort mehr lesen.
     if ["on", "off", "status"].contains(action) {
-        log("sudo fragt eventuell nach deinem Passwort (für pfctl).")
+        log("sudo fragt eventuell nach dem Passwort deines Mac-Users (HOST, nicht der VM) – für pfctl.")
         guard runInherited(sudo, ["-v"]) == 0 else { fail("sudo fehlgeschlagen.") }
+    }
+
+    /// pfctl über sudo -n (Passwort ist durch sudo -v schon bestätigt). Die Ausgabe wird ohne die
+    /// harmlose macOS-Meldung "No ALTQ support in kernel" weitergegeben.
+    func pf(_ a: [String]) -> Int32 {
+        let r = runCapture(sudo, ["-n", pfctl] + a)
+        r.output.split(separator: "\n")
+            .filter { !$0.hasPrefix("No ALTQ") && !$0.contains("ALTQ related") }
+            .forEach { log("  " + String($0)) }
+        return r.status
     }
 
     switch action {
@@ -638,7 +699,7 @@ func cmdFirewall(action: String, path: String, force: Bool) -> Never {
         do { try (rules + "\n").write(to: tmp, atomically: true, encoding: .utf8) } catch { fail("\(error)") }
 
         log("VM \(ipString) hängt an \(bridge.name). Lade in Anchor \(anchor):\n\n\(rules)\n")
-        let loaded = runInherited(sudo, [pfctl, "-a", anchor, "-f", tmp.path])
+        let loaded = pf(["-a", anchor, "-f", tmp.path])
         try? FileManager.default.removeItem(at: tmp)
         guard loaded == 0 else { fail("Regeln konnten nicht geladen werden (pfctl -f).") }
 
@@ -653,8 +714,8 @@ func cmdFirewall(action: String, path: String, force: Bool) -> Never {
 
     case "off":
         log("Leere Anchor \(anchor) – der Gast hat danach wieder vollen Netzzugang.")
-        guard runInherited(sudo, [pfctl, "-a", anchor, "-F", "rules"]) == 0 else { fail("pfctl -F fehlgeschlagen") }
-        guard runInherited(sudo, [pfctl, "-a", anchor, "-F", "states"]) == 0 else { fail("pfctl -F fehlgeschlagen") }
+        guard pf(["-a", anchor, "-F", "rules"]) == 0 else { fail("pfctl -F fehlgeschlagen") }
+        guard pf(["-a", anchor, "-F", "states"]) == 0 else { fail("pfctl -F fehlgeschlagen") }
         log("Firewall aus. Nach der Wartung: macvm firewall on \(path)")
         exit(0)
 
@@ -704,9 +765,15 @@ let usage = """
             [--models <ordner>]            Ordner read-only freigeben (wird gespeichert)
             [--no-models]                  Freigabe wieder entfernen
       macvm stop <dir>                     sauber herunterfahren, nach Timeout hart stoppen
-            [--user <name>]                SSH-User im Gast für den Shutdown (wird gespeichert)
+            [--user <name>]                wie: macvm users <dir> --llm <name>
             [--timeout 90] [--force]       Wartezeit in s / sofort hart stoppen
       macvm ip <dir>                       IP der laufenden VM
+      macvm users <dir>                    Gast-User anzeigen
+            [--admin <name>] [--llm <name>]  Gast-User setzen (wird gespeichert)
+      macvm ssh <dir> [--admin]            per SSH als LLM-User (bzw. Admin) einloggen
+            [ssh-optionen…] [-- befehl…]   z. B. macvm ssh <dir> -- uptime
+      macvm tunnel <dir> <port>…           Ports aus dem Gast als LLM-User auf localhost holen
+      macvm copy-id <dir> [--admin]        SSH-Schlüssel beim LLM-User (bzw. Admin) hinterlegen
       macvm firewall on <dir> [--force]    Gast abschotten (pf auf dem Host, braucht sudo)
       macvm firewall off <dir>             Abschottung aufheben (Wartung: Updates, Downloads)
       macvm firewall status <dir>          Zustand prüfen (Exit-Code 0 = wirksam)
@@ -770,6 +837,37 @@ case "stop":
 case "ip":
     guard let dir = args.first else { log(usage); exit(1) }
     cmdIP(path: dir)
+case "users":
+    let admin = option("--admin")
+    let llm = option("--llm")
+    guard args.count == 1, let dir = args.first else { log(usage); exit(1) }
+    cmdUsers(path: dir, admin: admin, llm: llm)
+case "ssh":
+    // Alles nach "--" ist der Befehl im Gast und wird nicht als macvm-Option gelesen.
+    var remote: [String] = []
+    if let i = args.firstIndex(of: "--") {
+        remote = Array(args[(i + 1)...])
+        args.removeSubrange(i...)
+    }
+    let admin = flag("--admin")
+    guard let dir = args.first else { log(usage); exit(1) }
+    let sshOptions = Array(args.dropFirst())
+    execTool("/usr/bin/ssh", sshOptions + [sshTarget(path: dir, admin: admin)] + remote)
+case "tunnel":
+    guard args.count >= 2, let dir = args.first else { log(usage); exit(1) }
+    let ports = args.dropFirst().map { p -> Int in
+        guard let port = Int(p), (1...65535).contains(port) else { fail("Ungültiger Port '\(p)'") }
+        return port
+    }
+    let target = sshTarget(path: dir, admin: false)
+    ports.forEach { log("http://localhost:\($0) → Gast localhost:\($0)") }
+    log("Tunnel offen, beenden mit Ctrl-C.")
+    let forwards = ports.flatMap { ["-L", "\($0):localhost:\($0)"] }
+    execTool("/usr/bin/ssh", ["-N", "-o", "ExitOnForwardFailure=yes"] + forwards + [target])
+case "copy-id":
+    let admin = flag("--admin")
+    guard args.count == 1, let dir = args.first else { log(usage); exit(1) }
+    execTool("/usr/bin/ssh-copy-id", [sshTarget(path: dir, admin: admin)])
 case "firewall":
     let force = flag("--force")
     guard args.count == 2 else { log(usage); exit(1) }
