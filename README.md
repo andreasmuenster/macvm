@@ -76,7 +76,7 @@ make clean
 make check
 ```
 
-`make check` runs everything the CI runs. It never starts, creates or changes a VM, never calls `sudo` or `pfctl`, and leaves `./macvm` alone; all output goes to `.build/check/`. The GitHub Actions workflow `.github/workflows/check.yml` runs the same `make check` on a macOS 26 arm64 runner (`macos-26`, Xcode 26.6) for every push to `main` and every pull request. Hosted runners cannot start macOS guests, so the CI does not boot a VM either.
+`make check` runs everything the CI runs. It never starts, creates or changes a VM, never calls `sudo` or `pfctl`, and leaves `./macvm` alone; all output goes to `.build/check/`. The GitHub Actions workflow `.github/workflows/check.yml` runs the same `make check` on a macOS 26 arm64 runner (`macos-26`, Xcode 26.6) for every push to `main` and every pull request. Hosted runners cannot start macOS guests, so the CI does not boot a VM either. The workflow pins its actions by commit SHA; Dependabot (`.github/dependabot.yml`) proposes updates for them once a week, after a 7-day cooldown.
 
 1. A fresh release build with warnings treated as errors, signed and checked like `make`.
 2. Unit tests in `tests/UnitTests.swift` for the pure functions: IPv4 and subnet logic, MAC normalization, pf rules, VM directory paths, `config.json`, the model folder check, and the option parser. `main.swift` stays a single file: everything above the line `// MARK: - Einstieg` is compiled together with the tests, so functions and types belong above that line.
