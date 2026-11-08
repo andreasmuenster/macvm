@@ -70,6 +70,18 @@ make clean
 
 `make` builds for `arm64-apple-macos26.0` and ad-hoc signs the binary with the hardened runtime and exactly one entitlement, `com.apple.security.virtualization`. It then runs `scripts/verify-signature.sh`, which prints the embedded entitlements and fails if the signature is invalid, if any other entitlement is present, or if the binary is not arm64 with minimum macOS 26.0. It rebuilds only when `main.swift`, the entitlements file or the `Makefile` has changed.
 
+### Checks
+
+```zsh
+make check
+```
+
+`make check` runs everything the CI runs. It never starts, creates or changes a VM, never calls `sudo` or `pfctl`, and leaves `./macvm` alone; all output goes to `.build/check/`.
+
+1. A fresh release build with warnings treated as errors, signed and checked like `make`.
+2. Unit tests in `tests/UnitTests.swift` for the pure functions: IPv4 and subnet logic, MAC normalization, pf rules, VM directory paths, `config.json`, the model folder check, and the option parser. `main.swift` stays a single file: everything above the line `// MARK: - Einstieg` is compiled together with the tests, so functions and types belong above that line.
+3. CLI tests in `tests/cli.sh` against the signed binary: usage and the error paths of the option parser, plus `macvm users` on a dummy `config.json` in a temporary directory.
+
 > If you used `make install`, make sure you run the freshly built binary. `which macvm` shows which copy your shell picks up. The examples below use `./macvm` from the project directory.
 
 ## Conventions used in this document

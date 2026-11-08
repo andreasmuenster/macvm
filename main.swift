@@ -859,6 +859,10 @@ func flag(_ name: String) -> Bool {
     return true
 }
 
+// MARK: - Einstieg
+// Ab hier nur Top-Level-Code. `make check` übersetzt für die Unit-Tests (tests/UnitTests.swift)
+// alles oberhalb dieser Marke als Bibliothek; Funktionen und Typen gehören daher nach oben.
+
 guard let command = args.first else { log(usage); exit(1) }
 args.removeFirst()
 
