@@ -1,0 +1,42 @@
+# CI für macvm: ruft denselben Einstieg wie lokal auf (`make check`): Release-Build mit Warnungen
+# als Fehler, Ad-hoc-Signatur mit Entitlement-Prüfung, Unit- und CLI-Tests. VMs startet die CI nicht:
+# Auf den gehosteten Runnern gibt es keine verschachtelte Virtualisierung für macOS-Gäste.
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # macOS 26 auf arm64: main.swift braucht das macOS-26-SDK (vmnet_network_create), und die Tests
+    # führen das Binary aus (Mindest-macOS 26.0). macos-15 hat zwar Xcode 26, startet das Binary aber nicht.
+    # Bewusst nicht macos-latest, damit ein Wechsel des Images eine sichtbare Änderung hier ist.
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      # Xcode fest gewählt statt des Image-Standards (Stand Image 20261026: Xcode 26.6, macOS-SDK 26.5).
+      # Entfernt GitHub diese Version aus dem Image, schlägt der Job sichtbar fehl; dann hier nachziehen.
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Werkzeuge anzeigen
+        run: |
+          sw_vers
+          xcrun swiftc --version
+          echo "macOS-SDK $(xcrun --sdk macosx --show-sdk-version)"
+
+      - name: make check
+        run: make check
