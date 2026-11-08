@@ -50,7 +50,8 @@ Additional capabilities:
 ## Requirements
 
 - A Mac with Apple silicon. macOS guests are only supported on Apple silicon.
-- Xcode Command Line Tools on the host (`swiftc`, `codesign`, `make`).
+- macOS 26 or later on the host. macvm uses the vmnet network API that macOS 26 introduced.
+- Xcode Command Line Tools on the host (`swiftc`, `codesign`, `make`) with the macOS 26 SDK or later.
 - An admin account on the host. The firewall uses `sudo pfctl`.
 - Enough free resources for the guest. The defaults are 12 CPUs, 100 GB RAM and a 250 GB sparse disk.
 
@@ -61,12 +62,13 @@ No Apple Developer account is required.
 ```zsh
 xcode-select --install  # if the Command Line Tools are not installed yet
 make                    # build and ad-hoc sign
+make verify             # check signature, entitlements, architecture and minimum macOS again
 make install            # optional: copy to ~/.local/bin (or: make install PREFIX=/opt/macvm)
 make uninstall
 make clean
 ```
 
-`make` ad-hoc signs the binary with exactly one entitlement, `com.apple.security.virtualization`, and prints the embedded entitlements so you can check them. It rebuilds only when `main.swift` or the entitlements file has changed.
+`make` builds for `arm64-apple-macos26.0` and ad-hoc signs the binary with the hardened runtime and exactly one entitlement, `com.apple.security.virtualization`. It then runs `scripts/verify-signature.sh`, which prints the embedded entitlements and fails if the signature is invalid, if any other entitlement is present, or if the binary is not arm64 with minimum macOS 26.0. It rebuilds only when `main.swift`, the entitlements file or the `Makefile` has changed.
 
 > If you used `make install`, make sure you run the freshly built binary. `which macvm` shows which copy your shell picks up. The examples below use `./macvm` from the project directory.
 
